@@ -30,6 +30,7 @@ export default function App() {
   const [transcript, setTranscript] = useState<string>("");
   const [videoInfo, setVideoInfo] = useState<any>(null);
   const [showExportMenu, setShowExportMenu] = useState(false);
+  const [errorDetails, setErrorDetails] = useState<string | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   // Close dropdown when clicking outside
@@ -44,37 +45,59 @@ export default function App() {
   }, []);
 
   const handleStartTranscription = async () => {
-    if (!url.trim()) return;
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl) return;
     
-    setState("loading");
+    // Reset state for new run
     setTranscript("");
+    setVideoInfo(null);
+    setErrorDetails(null);
+    setState("loading");
     
     try {
-      setLoadingStep("Fetching video metadata...");
-      const infoRes = await fetch(`/api/video-info?url=${encodeURIComponent(url)}`);
-      if (!infoRes.ok) throw new Error("Failed to get video info. This video might be unavailable or age-restricted.");
+      if (!process.env.GEMINI_API_KEY) {
+        throw new Error("Gemini API Key is missing. Please provide it in the Secrets panel or .env file.");
+      }
+
+      setLoadingStep("Fetching video metadata from YouTube...");
+      console.log("[TRANSCRIPTION] Starting for URL:", trimmedUrl);
+      
+      const infoRes = await fetch(`/api/video-info?url=${encodeURIComponent(trimmedUrl)}`);
+      if (!infoRes.ok) {
+        const errData = await infoRes.json().catch(() => ({ error: "Server connection failed" }));
+        throw new Error(errData.error || `Source fetch failed (${infoRes.status})`);
+      }
+      
       const info = await infoRes.json();
       setVideoInfo(info);
 
-      setLoadingStep("Processing audio stream...");
-      // We fetch the audio via our proxy to avoid CORS
+      setLoadingStep("Connecting to audio stream...");
+      console.log("[TRANSCRIPTION] Metadata retrieved, fetching audio stream...");
       const audioRes = await fetch(`/api/proxy-audio?url=${encodeURIComponent(info.audioUrl)}`);
-      if (!audioRes.ok) throw new Error("Failed to process audio stream.");
+      if (!audioRes.ok) {
+        const errText = await audioRes.text().catch(() => "Unknown stream error");
+        throw new Error(`Audio Stream Error: ${errText}`);
+      }
       
+      setLoadingStep("Buffering audio content... (this may take 10-30 seconds)");
       const audioBlob = await audioRes.blob();
+      console.log(`[TRANSCRIPTION] Audio blob ready: ${Math.round(audioBlob.size / 1024)}KB`);
       
-      setLoadingStep("Preparing audio for AI...");
+      setLoadingStep("Encoding audio for AI analysis...");
       const base64Data = await blobToBase64(audioBlob);
       
-      setLoadingStep(`Transcribing audio in ${language}...`);
+      setLoadingStep(`Transcribing ${language} content (AI is processing)...`);
+      console.log("[TRANSCRIPTION] Sending data to Gemini...");
       
-      const prompt = `Transcribe the following audio in ${language}. 
-      Mandatory requirements:
-      1. Include timestamps for every significant speaker change or at least every 30-60 seconds in the format [MM:SS] or [HH:MM:SS].
-      2. Identify speakers if possible (e.g., "Speaker 1", "Speaker 2" or their real names if detectable).
-      3. Maintain high precision and clean formatting.
-      4. If the language is Arabic, ensure modern standard Arabic or the speaker's dialect is captured accurately.
-      5. Output ONLY the transcription content with timestamps and speaker names.`;
+      const prompt = `You are a professional transcriber. Transcribe the provided audio into ${language}.
+      
+      REQUIREMENTS:
+      1. COMPLETE TRANSCRIPTION: Transcribe every single word. No summaries.
+      2. TIMESTAMPS: Add [MM:SS] timestamps at the start of every speaker turn or every 30 seconds.
+      3. SPEAKER LABELS: Identify distinct speakers if possible (e.g. Speaker 1, Speaker 2).
+      4. FORMATTING: Use clean, professional line breaks.
+      5. LANGUAGE: If Arabic, use clear and accurate script.
+      6. No preamble. Start with the transcript text immediately.`;
 
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
@@ -93,14 +116,16 @@ export default function App() {
         ]
       });
 
-      if (!response.text) throw new Error("No transcription generated.");
+      const responseText = response.text;
+      if (!responseText) throw new Error("The AI returned an empty response. The audio might be silent or unreadable.");
       
-      setTranscript(response.text);
+      setTranscript(responseText);
       setState("result");
+      console.log("[TRANSCRIPTION] Process complete!");
     } catch (err: any) {
-      console.error(err);
-      alert(`Transcription Failed: ${err.message}`);
-      setState("input");
+      console.error("[TRANSCRIPTION] Fatal failure:", err);
+      setErrorDetails(err.message || "An unknown error occurred.");
+      setState("input"); // We go back to input but with errorDetails visible
     }
   };
 
@@ -191,6 +216,22 @@ export default function App() {
 
               {/* Input Form */}
               <div className="bg-white p-8 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.05)] border border-gray-100 space-y-8">
+                {errorDetails && (
+                  <motion.div 
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: 'auto' }}
+                    className="p-4 bg-red-50 border border-red-100 rounded-xl text-red-600 text-sm font-medium flex items-start gap-3"
+                  >
+                    <div className="p-1 bg-red-100 rounded-full mt-0.5">
+                      <div className="w-1.5 h-1.5 bg-red-600 rounded-full" />
+                    </div>
+                    <div>
+                      <p className="font-bold mb-1">Transcription Failed</p>
+                      <p className="opacity-80">{errorDetails}</p>
+                    </div>
+                  </motion.div>
+                )}
+
                 <div className="space-y-3">
                   <label htmlFor="url" className="text-sm font-semibold uppercase tracking-widest text-gray-400 flex items-center gap-2">
                     <Youtube className="w-4 h-4" />
